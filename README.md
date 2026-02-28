@@ -40,3 +40,13 @@ I developed this tool to simplify my own workflow when dealing with serial port 
 
 ---
 *Bu proje açık kaynaklıdır ve geliştirilmeye müsaittir. İşinize yaraması dileğiyle.*
+
+
+<img width="1920" height="1032" alt="Ekran görüntüsü 2026-02-28 225127" src="https://github.com/user-attachments/assets/755a9932-bd5c-4aaf-a46e-8885656effe0" />
+<img width="951" height="965" alt="Ekran görüntüsü 2026-02-28 225828" src="https://github.com/user-attachments/assets/66966176-bc94-4e3b-bee9-d3fc27ff998c" />
+
+<img width="870" height="516" alt="Ekran görüntüsü 2026-02-28 225638" src="https://github.com/user-attachments/assets/81491384-3148-40f1-961c-de341297001a" />
+<img width="506" height="273" alt="Ekran görüntüsü 2026-02-28 225547" src="https://github.com/user-attachments/assets/f968c873-0c49-41c9-99f2-cfceb809ff3b" />
+<img width="704" height="513" alt="Ekran görüntüsü 2026-02-28 225416" src="https://github.com/user-attachments/assets/a45bdb59-4990-4d3b-9420-9dfef19d4e87" />
+<img width="746" height="493" alt="Ekran görüntüsü 2026-02-28 225315" src="https://github.com/user-attachments/assets/a45e27d9-3e38-4e77-92ff-a3cbf5cf0ac7" />
+
