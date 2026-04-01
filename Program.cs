@@ -81,9 +81,32 @@ namespace TekDosyaSeriPort
 
         public bool IsAtBottom()
         {
-            GetScrollRange(this.Handle, SB_VERT, out _, out int max);
+            GetScrollRange(this.Handle, SB_VERT, out int min, out int max);
             int pos = GetScrollPos(this.Handle, SB_VERT);
-            return pos >= max - 5;
+            int clientH = this.ClientSize.Height;
+            // FIX: Scroll range = max - min, visible area = clientH
+            // Kullanıcı en alttaysa pos + visible >= max olmalı
+            // Emoji ve farklı font boyutlarında toleransı artır
+            int threshold = Math.Max(this.Font.Height * 2, 20);
+            return pos >= max - threshold;
+        }
+
+        // KESİN AŞAĞI KAYDIRMA METODU
+        public void ScrollToAbsoluteBottom()
+        {
+            if (this.IsDisposed) return;
+
+            // 1. İmleci kesin olarak en sona al
+            this.SelectionStart = this.TextLength;
+            this.SelectionLength = 0;
+            this.ScrollToCaret();
+
+            // 2. RichTextBox'ın emoji/farklı fontlarda satır boyunu yanlış hesaplama bug'ı için OS seviyesinde komutlar
+            SendMessage(this.Handle, 0x0115 /*WM_VSCROLL*/, (IntPtr)7 /*SB_BOTTOM*/, IntPtr.Zero);
+            SendMessage(this.Handle, 0x00B7 /*EM_SCROLLCARET*/, IntPtr.Zero, IntPtr.Zero);
+
+            // 3. Ekranı zorla yeniden çizdir (Fareyle yukarı/aşağı yapma etkisini kodla yaratır)
+            this.Invalidate();
         }
 
         protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
@@ -109,7 +132,9 @@ namespace TekDosyaSeriPort
 
             base.WndProc(ref m);
 
-            if (m.Msg == 0x0115 || m.Msg == 0x000F || m.Msg == 0x0100)
+            // FIX: WM_PAINT (0x000F) kaldırıldı — her çizim sırasında gereksiz scroll event'leri tetikliyordu
+            // 0x0115 = WM_VSCROLL, 0x0100 = WM_KEYDOWN
+            if (m.Msg == 0x0115 || m.Msg == 0x0100)
             {
                 Scrolled?.Invoke(this, EventArgs.Empty);
                 if (IsAtBottom()) ScrolledToBottom?.Invoke(this, EventArgs.Empty);
@@ -165,13 +190,59 @@ namespace TekDosyaSeriPort
         private Color _originalDragSourceColor;
         private Color _originalDragTargetColor;
         private readonly string _profilesPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "appearance_profiles.json");
+        private readonly string _ignoredPortsPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "ignored_ports.json");
 
         private readonly string _highlightsPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "highlight_rules.json");
         private Dictionary<string, (Color Fore, Color Back)> _highlightRules = new(StringComparer.OrdinalIgnoreCase);
         private Regex? _highlightRegex = null;
         private static Random _rnd = new Random();
 
+        // YENİ EKLENEN: 12 Adet Vurgu Teması (Zıt ve okunaklı renkler)
+        private readonly (string Name, Color Fore, Color Back)[] _highlightThemes = new[]
+        {
+            ("Başarı (Success)", Color.White, Color.DarkGreen),
+            ("Bilgi (Info)", Color.White, Color.DarkBlue),
+            ("Uyarı (Warning)", Color.Black, Color.Gold),
+            ("Hata (Error)", Color.White, Color.DarkRed),
+            ("Koyu Mor", Color.White, Color.DarkMagenta),
+            ("Turuncu", Color.Black, Color.DarkOrange),
+            ("Gri", Color.Black, Color.LightGray),
+            ("Pembe", Color.Black, Color.HotPink),
+            ("Turkuaz", Color.White, Color.Teal),
+            ("Kahverengi", Color.White, Color.SaddleBrown),
+            ("Gece Mavisi", Color.White, Color.MidnightBlue),
+            ("Hacker", Color.LimeGreen, Color.Black)
+        };
+
         private ToolTip _toolTip = new ToolTip();
+        private Label? _welcomeLabel;
+
+        // === OTOMATİK PORT PAYLAŞIMI — Bilinen seri port programlarını izle ===
+        private System.Windows.Forms.Timer? _processMonitor;
+        private bool _autoReleased = false; // portlar otomatik serbest bırakıldı mı?
+        private string? _blockingProcessName = null; // hangi program blokluyor
+        private static readonly HashSet<string> _knownSerialProcesses = new(StringComparer.OrdinalIgnoreCase)
+        {
+            // Arduino
+            "arduino", "arduino_debug", "arduino-cli", "arduino-builder",
+            // PlatformIO
+            "platformio", "pio", "platformio-core",
+            // Firmware upload araçları
+            "esptool", "esptool.py", "avrdude", "stm32flash", "openocd",
+            "bossac", "dfu-util", "teensy_loader_cli", "nrfjprog",
+            "west", "pyocd", "JFlash", "JLink", "JLinkExe",
+            // Terminal programları
+            "putty", "teraterm", "ttermpro", "minicom", "screen",
+            "realterm", "coolterm", "hercules", "moserial",
+            "sscom", "accessport", "comtool",
+            // Python seri araçları (yaygın isimler)
+            "miniterm", "pyserial-miniterm",
+            // Diğer araçlar
+            "stm32cubeprogrammer", "STM32CubeProgrammer",
+            "nrf-connect", "segger_embedded_studio"
+        };
+
+
 
         private Button btnLanguage = null!;
         private Button btnHelp = null!;
@@ -195,6 +266,9 @@ namespace TekDosyaSeriPort
             this.WindowState = FormWindowState.Maximized;
             this.BackColor = Color.FromArgb(45, 45, 48);
             this.Icon = GenerateAppIcon();
+
+            // Kapatılan portları diskten yükle
+            _ignoredPorts = LoadIgnoredPorts();
 
             UpdateFormTitle();
             Lang.Changed += UpdateFormTitle;
@@ -304,13 +378,181 @@ namespace TekDosyaSeriPort
             bgMenu.Items.Add(itemLog);
             _mainLayout.ContextMenuStrip = bgMenu;
 
+            // UX: Hoş geldiniz mesajı — port bağlı değilken gösterilir
+            _welcomeLabel = new Label
+            {
+                Text = Lang.Get(
+                    "Serial Port Studio\n\nBir COM cihazı bağlayın — otomatik algılanacaktır.\n\nSağ tıklayarak kapalı portları yeniden açabilirsiniz.\nYardım için F1 tuşuna basın.",
+                    "Serial Port Studio\n\nPlug in a COM device — it will be detected automatically.\n\nRight-click to reopen closed ports.\nPress F1 for help."),
+                Dock = DockStyle.Fill,
+                ForeColor = Color.FromArgb(120, 120, 130),
+                BackColor = Color.FromArgb(30, 30, 30),
+                Font = new Font("Segoe UI", 14f, FontStyle.Regular),
+                TextAlign = ContentAlignment.MiddleCenter,
+                AutoSize = false
+            };
+            _mainLayout.Controls.Add(_welcomeLabel);
+            Lang.Changed += () =>
+            {
+                if (_welcomeLabel != null && !_welcomeLabel.IsDisposed)
+                    _welcomeLabel.Text = Lang.Get(
+                        "Serial Port Studio\n\nBir COM cihazı bağlayın — otomatik algılanacaktır.\n\nSağ tıklayarak kapalı portları yeniden açabilirsiniz.\nYardım için F1 tuşuna basın.",
+                        "Serial Port Studio\n\nPlug in a COM device — it will be detected automatically.\n\nRight-click to reopen closed ports.\nPress F1 for help.");
+            };
+
             this.Controls.Add(bottomContainer);
             this.Controls.Add(_mainLayout);
             _mainLayout.BringToFront();
 
-            this.Load += (s, e) => { CheckPorts(this, EventArgs.Empty); StartScanner(); };
+            this.Load += (s, e) => { CheckPorts(this, EventArgs.Empty); StartScanner(); StartProcessMonitor(); };
             this.ResizeEnd += (s, e) => RearrangeGrid();
             this.SizeChanged += (s, e) => RearrangeGrid();
+        }
+
+        // === OTOMATİK PORT PAYLAŞIMI: Proses İzleyici ===
+        private void StartProcessMonitor()
+        {
+            _processMonitor = new System.Windows.Forms.Timer { Interval = 2000 };
+            _processMonitor.Tick += (s, e) => CheckForSerialProcesses();
+            _processMonitor.Start();
+        }
+
+        private void CheckForSerialProcesses()
+        {
+            try
+            {
+                string? foundProcess = null;
+                foreach (var proc in System.Diagnostics.Process.GetProcesses())
+                {
+                    try
+                    {
+                        string pName = proc.ProcessName;
+                        if (_knownSerialProcesses.Contains(pName))
+                        {
+                            foundProcess = pName;
+                            proc.Dispose();
+                            break;
+                        }
+                        proc.Dispose();
+                    }
+                    catch { }
+                }
+
+                if (foundProcess != null && !_autoReleased)
+                {
+                    // Bilinen seri port programı algılandı — tüm portları serbest bırak
+                    _autoReleased = true;
+                    _blockingProcessName = foundProcess;
+                    AutoReleaseAllPorts(foundProcess);
+                }
+                else if (foundProcess == null && _autoReleased)
+                {
+                    // Program kapandı — tüm portları geri bağla
+                    _autoReleased = false;
+                    string oldProcess = _blockingProcessName ?? "?";
+                    _blockingProcessName = null;
+                    AutoReclaimAllPorts(oldProcess);
+                }
+            }
+            catch { }
+        }
+
+        private void AutoReleaseAllPorts(string processName)
+        {
+            foreach (var kv in _portMap.ToList())
+            {
+                GroupBox gb = kv.Key;
+                SerialPort sp = kv.Value;
+                if (sp == null || gb.IsDisposed) continue;
+                string portName = sp.PortName;
+
+                // Zaten durdurulmuş veya serbest bırakılmışsa dokunma
+                if (_portPaused.GetValueOrDefault(portName)) continue;
+
+                _portPaused[portName] = true;
+                try { if (sp.IsOpen) sp.Close(); } catch { }
+
+                try
+                {
+                    if (!gb.IsDisposed)
+                        gb.BeginInvoke((MethodInvoker)delegate
+                        {
+                            if (gb.IsDisposed) return;
+                            gb.Text = $"{portName} - {Lang.Get($"SERBEST ({processName})", $"RELEASED ({processName})")}";
+                            gb.ForeColor = Color.FromArgb(180, 140, 220);
+                            Button? btn = FindTaggedButton(gb, "btnRelease");
+                            if (btn != null)
+                            {
+                                btn.Text = Lang.Get("🔒 Geri Al", "🔒 Reclaim");
+                                btn.BackColor = Color.FromArgb(140, 80, 180);
+                            }
+                        });
+                }
+                catch (ObjectDisposedException) { }
+            }
+            UpdateStatusBar();
+        }
+
+        private void AutoReclaimAllPorts(string processName)
+        {
+            foreach (var kv in _portMap.ToList())
+            {
+                GroupBox gb = kv.Key;
+                SerialPort sp = kv.Value;
+                if (sp == null || gb.IsDisposed) continue;
+                string portName = sp.PortName;
+
+                // Sadece otomatik serbest bırakılanları geri al (manuel pause edilenlere dokunma)
+                if (!_portPaused.GetValueOrDefault(portName)) continue;
+                // Başlıkta SERBEST/RELEASED yazıyorsa otomatik bırakılmıştır
+                string title = "";
+                try { if (!gb.IsDisposed) title = gb.Text; } catch { continue; }
+                if (!title.Contains("SERBEST") && !title.Contains("RELEASED")) continue;
+
+                try
+                {
+                    if (!sp.IsOpen) { sp.Open(); sp.DiscardInBuffer(); }
+                    _portPaused[portName] = false;
+                    int baud = sp.BaudRate;
+
+                    if (!gb.IsDisposed)
+                        gb.BeginInvoke((MethodInvoker)delegate
+                        {
+                            if (gb.IsDisposed) return;
+                            gb.Text = $"{portName} - {Lang.Get("AÇIK", "ONLINE")} ({baud})";
+                            gb.ForeColor = Color.White;
+                            Button? btn = FindTaggedButton(gb, "btnRelease");
+                            if (btn != null)
+                            {
+                                btn.Text = Lang.Get("🔓 Serbest", "🔓 Release");
+                                btn.BackColor = Color.FromArgb(75, 75, 78);
+                            }
+                        });
+                }
+                catch
+                {
+                    // Port hâlâ meşgul — bir sonraki tick'te tekrar dener
+                    _autoReleased = true;
+                    _blockingProcessName = processName;
+                    return;
+                }
+            }
+            UpdateStatusBar();
+        }
+
+        // Tag ile buton bul (recursive, panel'ler içinde de arar)
+        private Button? FindTaggedButton(Control parent, string tag)
+        {
+            foreach (Control c in parent.Controls)
+            {
+                if (c is Button btn && btn.Tag?.ToString() == tag) return btn;
+                if (c is Panel)
+                {
+                    var found = FindTaggedButton(c, tag);
+                    if (found != null) return found;
+                }
+            }
+            return null;
         }
 
         private void UpdateUIStrings()
@@ -762,11 +1004,18 @@ namespace TekDosyaSeriPort
 
         private IEnumerable<ScrollAwareRichTextBox> GetAllRtbs()
         {
-            return _mainLayout.Controls.OfType<GroupBox>()
+            var allBoxes = _mainLayout.Controls.OfType<GroupBox>()
                    .Concat(_minimizedBoxes.Values)
-                   .Concat(_detachedForms.SelectMany(f => f.Controls.OfType<GroupBox>()))
-                   .Select(g => g.Controls.Find("rtbOutput", true).FirstOrDefault())
-                   .OfType<ScrollAwareRichTextBox>();
+                   .Concat(_detachedForms.SelectMany(f => f.Controls.OfType<GroupBox>()));
+
+            // GİZLİ KAHRAMAN: Eğer tam ekrana (zoom) alınmış bir pencere varsa, onu da listeye ekle!
+            if (_zoomedBox != null)
+            {
+                allBoxes = allBoxes.Concat(new[] { _zoomedBox });
+            }
+
+            return allBoxes.Select(g => g.Controls.Find("rtbOutput", true).FirstOrDefault())
+                           .OfType<ScrollAwareRichTextBox>();
         }
 
         private void ApplyHighlightsToAllWindows()
@@ -782,11 +1031,12 @@ namespace TekDosyaSeriPort
             int savedStart = rtb.SelectionStart, savedLen = rtb.SelectionLength;
             try
             {
+                using Font hlBoldFont = new Font(rtb.Font, FontStyle.Bold);
                 var matches = _highlightRegex.Matches(rtb.Text);
                 foreach (Match m in matches)
                 {
                     rtb.SelectionStart = m.Index; rtb.SelectionLength = m.Length;
-                    if (_highlightRules.TryGetValue(m.Value, out var colors)) { rtb.SelectionColor = colors.Fore; rtb.SelectionBackColor = colors.Back; rtb.SelectionFont = new Font(rtb.Font, FontStyle.Bold); }
+                    if (_highlightRules.TryGetValue(m.Value, out var colors)) { rtb.SelectionColor = colors.Fore; rtb.SelectionBackColor = colors.Back; rtb.SelectionFont = hlBoldFont; }
                 }
             }
             catch { }
@@ -803,17 +1053,19 @@ namespace TekDosyaSeriPort
                 int savedStart = rtb.SelectionStart, savedLen = rtb.SelectionLength;
                 try
                 {
+                    using Font regularFontTemp = new Font(rtb.Font, FontStyle.Regular);
+                    using Font boldFontTemp = new Font(rtb.Font, FontStyle.Bold);
                     string textLower = rtb.Text.ToLower(), wordLower = removedWord.ToLower();
                     int idx = 0, wLen = removedWord.Length;
                     while ((idx = textLower.IndexOf(wordLower, idx)) != -1)
                     {
                         rtb.SelectionStart = idx; rtb.SelectionLength = wLen;
-                        rtb.SelectionBackColor = rtb.BackColor; rtb.SelectionColor = rtb.ForeColor; rtb.SelectionFont = new Font(rtb.Font, FontStyle.Regular);
+                        rtb.SelectionBackColor = rtb.BackColor; rtb.SelectionColor = rtb.ForeColor; rtb.SelectionFont = regularFontTemp;
                         if (_highlightRegex != null && _highlightRules.Count > 0)
                         {
                             string seg = rtb.Text.Substring(idx, wLen);
                             var m = _highlightRegex.Match(seg);
-                            if (m.Success && m.Index == 0 && m.Length == wLen && _highlightRules.TryGetValue(m.Value, out var c2)) { rtb.SelectionColor = c2.Fore; rtb.SelectionBackColor = c2.Back; rtb.SelectionFont = new Font(rtb.Font, FontStyle.Bold); }
+                            if (m.Success && m.Index == 0 && m.Length == wLen && _highlightRules.TryGetValue(m.Value, out var c2)) { rtb.SelectionColor = c2.Fore; rtb.SelectionBackColor = c2.Back; rtb.SelectionFont = boldFontTemp; }
                         }
                         idx += wLen;
                     }
@@ -888,7 +1140,7 @@ namespace TekDosyaSeriPort
                 foreach (var kv in _highlightRules.ToList())
                 {
                     string word = kv.Key; Color foreColor = kv.Value.Fore; Color backColor = kv.Value.Back;
-                    int btnW = Math.Max(100, Math.Min(320, TextRenderer.MeasureText(word, new Font("Segoe UI", 9.5f, FontStyle.Bold)).Width + 28));
+                    int btnW; using (Font measureFont = new Font("Segoe UI", 9.5f, FontStyle.Bold)) { btnW = Math.Max(100, Math.Min(320, TextRenderer.MeasureText(word, measureFont).Width + 28)); }
                     Button b = new Button { Text = word, BackColor = backColor, ForeColor = foreColor, AutoSize = false, Size = new Size(btnW, 36), FlatStyle = FlatStyle.Flat, Margin = new Padding(5), Cursor = Cursors.Hand, Font = new Font("Segoe UI", 9.5f, FontStyle.Bold), TextAlign = ContentAlignment.MiddleCenter, Tag = word };
                     b.FlatAppearance.BorderColor = Color.FromArgb(80, 80, 80); b.FlatAppearance.BorderSize = 1; b.FlatAppearance.MouseOverBackColor = ControlPaint.Light(backColor, 0.2f);
                     b.Click += (sender, args) => { foreach (var action in _windowSearchActions.Values.ToList()) action(word); dlg.Close(); };
@@ -1056,13 +1308,13 @@ namespace TekDosyaSeriPort
             groupBox.MouseUp += (s, e) => { if (_dragSource != null) { _dragSource.BackColor = _originalDragSourceColor; _dragSource = null; } if (_dragTarget != null) { _dragTarget.BackColor = _originalDragTargetColor; _dragTarget = null; } };
 
             // RTB — FIX #4: RtbWrapper sağ kenar beyaz alan sorunu çözüldü
-            Panel rtbWrapper = new Panel { Dock = DockStyle.Fill, BackColor = Color.Black };
+            // 10px Sol Boşluk (Padding) Eklendi
+            Panel rtbWrapper = new Panel { Dock = DockStyle.Fill, BackColor = Color.Black, Padding = new Padding(10, 5, 0, 5) };
             ScrollAwareRichTextBox rtbOutput = new ScrollAwareRichTextBox
             {
                 Name = "rtbOutput",
                 BackColor = Color.Black,
                 ForeColor = Color.LimeGreen,
-                // FIX #8: Emoji destekli font
                 Font = IsFontAvailable("Segoe UI Emoji")
                     ? new Font("Segoe UI Emoji", 10f, FontStyle.Regular)
                     : new Font("Consolas", 10f, FontStyle.Regular),
@@ -1070,10 +1322,14 @@ namespace TekDosyaSeriPort
                 BorderStyle = BorderStyle.None,
                 HideSelection = false,
                 ScrollBars = RichTextBoxScrollBars.Vertical,
-                // FIX #4: RichTextBox tam genişlik, scrollbar sağda sabit
                 Dock = DockStyle.Fill
             };
+
+            // Arka plan rengi değiştiğinde dış panelin rengini de senkronize et ki beyaz/farklı renk şerit oluşmasın
+            rtbOutput.BackColorChanged += (s, e) => rtbWrapper.BackColor = rtbOutput.BackColor;
             rtbWrapper.Controls.Add(rtbOutput);
+
+
 
             Color logTsColor = Color.FromArgb(0, 200, 220);
             Font logBoldFont = new Font("Consolas", 10, FontStyle.Bold);
@@ -1112,9 +1368,23 @@ namespace TekDosyaSeriPort
             Panel bottomPanel = new Panel { Dock = DockStyle.Bottom, Height = 33, BackColor = Color.FromArgb(55, 55, 58), Padding = new Padding(2, 5, 2, 5) };
 
             Button btnCopy = MakeButton(Lang.Get("📋 Kopyala", "📋 Copy"), 80);
-            btnCopy.Click += (s, e) => { if (!string.IsNullOrEmpty(rtbOutput.Text)) Clipboard.SetText(rtbOutput.Text); };
+            _toolTip.SetToolTip(btnCopy, Lang.Get("Tüm log içeriğini panoya kopyala", "Copy all log content to clipboard"));
+            btnCopy.Click += (s, e) =>
+            {
+                if (!string.IsNullOrEmpty(rtbOutput.Text))
+                {
+                    Clipboard.SetText(rtbOutput.Text);
+                    Color origColor = btnCopy.BackColor;
+                    btnCopy.BackColor = Color.FromArgb(0, 130, 60);
+                    btnCopy.Text = Lang.Get("✅ Kopyalandı", "✅ Copied");
+                    var feedbackTimer = new System.Windows.Forms.Timer { Interval = 1200 };
+                    feedbackTimer.Tick += (ft, fe) => { feedbackTimer.Stop(); feedbackTimer.Dispose(); if (!btnCopy.IsDisposed) { btnCopy.BackColor = origColor; btnCopy.Text = Lang.Get("📋 Kopyala", "📋 Copy"); } };
+                    feedbackTimer.Start();
+                }
+            };
 
             Button btnSaveAs = MakeButton(Lang.Get("💾 Dışa Aktar", "💾 Export"), 80);
+            _toolTip.SetToolTip(btnSaveAs, Lang.Get("Log verisini farklı bir dosyaya kaydet", "Export log data to a different file"));
             btnSaveAs.Click += (s, e) =>
             {
                 using var sfd = new SaveFileDialog { Title = Lang.Get("Farklı Kaydet", "Save As"), Filter = "Text File (*.txt)|*.txt|All Files (*.*)|*.*", FileName = Path.GetFileNameWithoutExtension(filePath) + "_export", InitialDirectory = _logFolderPath };
@@ -1122,9 +1392,11 @@ namespace TekDosyaSeriPort
             };
 
             Button btnClear = MakeButton(Lang.Get("🗑 Temizle", "🗑 Clear"), 70);
+            _toolTip.SetToolTip(btnClear, Lang.Get("Ekrandaki log verisini temizle", "Clear log data from display"));
             btnClear.Click += (s, e) => rtbOutput.Clear();
 
             Button btnSearchTrigger = MakeButton(Lang.Get("🔍 Ara", "🔍 Search"), 65);
+            _toolTip.SetToolTip(btnSearchTrigger, Lang.Get("Log içinde arama yap (Ctrl+F)", "Search within log (Ctrl+F)"));
             btnSearchTrigger.Click += (s, e) => { searchPanel.Visible = true; txtSearch.Focus(); txtSearch.SelectAll(); };
 
             // FIX #5: Label genişliği 320 → 200
@@ -1156,7 +1428,7 @@ namespace TekDosyaSeriPort
             cboSizeL.SelectedItem = 10;
 
             void CheckLogProfileState() { if (groupBox.IsDisposed) return; string cur = SerializeProfile(rtbOutput, cboFontL, cboSizeL, logTsColor); var profiles = LoadProfiles(); btnSmartSaveLog.Visible = !profiles.Values.Contains(cur); }
-            void ApplyLogFont() { string fn = cboFontL.SelectedItem?.ToString() ?? "Consolas"; int fs = cboSizeL.SelectedItem is int sz ? sz : 10; logRegularFont = new Font(fn, fs, FontStyle.Regular); logBoldFont = new Font(fn, fs, FontStyle.Bold); rtbOutput.Font = logRegularFont; CheckLogProfileState(); }
+            void ApplyLogFont() { string fn = cboFontL.SelectedItem?.ToString() ?? "Consolas"; int fs = cboSizeL.SelectedItem is int sz ? sz : 10; var oldRegular = logRegularFont; var oldBold = logBoldFont; logRegularFont = new Font(fn, fs, FontStyle.Regular); logBoldFont = new Font(fn, fs, FontStyle.Bold); rtbOutput.Font = logRegularFont; oldRegular?.Dispose(); oldBold?.Dispose(); CheckLogProfileState(); }
             cboFontL.SelectedIndexChanged += (s, e) => ApplyLogFont();
             cboSizeL.SelectedIndexChanged += (s, e) => ApplyLogFont();
 
@@ -1262,6 +1534,7 @@ namespace TekDosyaSeriPort
             logSettingsPanel.Controls.Add(logSettingsRow1);
 
             Button btnSettings = MakeButton(Lang.Get("⚙ Görünüm", "⚙ Settings"), 85);
+            _toolTip.SetToolTip(btnSettings, Lang.Get("Yazı tipi, renk ve profil ayarları", "Font, color and profile settings"));
             btnSettings.Click += (s, e) =>
             {
                 logSettingsPanel.Visible = !logSettingsPanel.Visible;
@@ -1278,7 +1551,6 @@ namespace TekDosyaSeriPort
             bottomPanel.Controls.Add(btnSettings);
 
             // Sağ tık menüsü
-            (Color Fore, Color Back) pendingHlColor = GenerateRandomHighlightColor();
             bool pendingIsRemove = false;
             ContextMenuStrip contextMenu = new ContextMenuStrip();
             ToolStripMenuItem menuCopySelected = new ToolStripMenuItem("📋  Kopyala") { Font = new Font("Segoe UI", 9.5f, FontStyle.Bold) };
@@ -1288,16 +1560,63 @@ namespace TekDosyaSeriPort
             ToolStripMenuItem menuSearchAll = new ToolStripMenuItem { Font = new Font("Segoe UI", 9.5f, FontStyle.Bold) };
             menuSearchAll.Click += (s, e) => { string term = rtbOutput.SelectedText.Trim(); if (string.IsNullOrEmpty(term)) return; foreach (var action in _windowSearchActions.Values.ToList()) action(term); };
             ToolStripMenuItem menuHighlight = new ToolStripMenuItem { Font = new Font("Segoe UI", 9.5f, FontStyle.Bold), ImageScaling = ToolStripItemImageScaling.None };
-            menuHighlight.Click += (s, e) => { string term = rtbOutput.SelectedText.Trim(); if (string.IsNullOrEmpty(term)) return; if (pendingIsRemove) { _highlightRules.Remove(term); SaveHighlights(); BuildHighlightRegex(); RemoveWordHighlightFromAllWindows(term); } else { _highlightRules[term] = pendingHlColor; SaveHighlights(); BuildHighlightRegex(); ApplyHighlightsToAllWindows(); } };
+            menuHighlight.Click += (s, e) => { if (pendingIsRemove) { string term = rtbOutput.SelectedText.Trim(); if (string.IsNullOrEmpty(term)) return; _highlightRules.Remove(term); SaveHighlights(); BuildHighlightRegex(); RemoveWordHighlightFromAllWindows(term); } };
             ToolStripMenuItem menuCloseLog = new ToolStripMenuItem(Lang.Get("Bu Pencereyi Kapat", "Close This Window")) { Font = new Font("Segoe UI", 9.5f, FontStyle.Bold) };
             menuCloseLog.Click += (s, e) => { var minKey = _minimizedBoxes.FirstOrDefault(kv => kv.Value == groupBox).Key; if (minKey != null) { _minimizedBoxes.Remove(minKey); UpdateMinimizedBarWithLogs(); } _mainLayout.Controls.Remove(groupBox); groupBox.Dispose(); RearrangeGrid(); };
             contextMenu.Opening += (s, e) =>
             {
                 bool hasSel = rtbOutput.SelectionLength > 0;
                 menuSearchThis.Enabled = hasSel; menuSearchAll.Enabled = hasSel; menuHighlight.Enabled = hasSel;
-                if (hasSel) { string fullTerm = rtbOutput.SelectedText.Trim(); string preview = fullTerm.Length > 22 ? fullTerm.Substring(0, 22) + "..." : fullTerm; menuSearchThis.Text = Lang.Get($"🔍 Bu Pencerede Ara: \"{preview}\"", $"🔍 Search in This Window: \"{preview}\""); menuSearchAll.Text = Lang.Get($"🔍 Tüm Pencerelerde Ara: \"{preview}\"", $"🔍 Search in All Windows: \"{preview}\""); bool alreadyHL = !string.IsNullOrEmpty(fullTerm) && _highlightRules.ContainsKey(fullTerm); if (alreadyHL) { pendingIsRemove = true; var ec = _highlightRules[fullTerm]; menuHighlight.Text = Lang.Get($"🗑 Vurguyu Kaldır '{preview}'", $"🗑 Remove Highlight '{preview}'"); menuHighlight.Image = GenerateColorPreviewBitmap(ec.Fore, ec.Back); } else { pendingIsRemove = false; pendingHlColor = GenerateRandomHighlightColor(); menuHighlight.Text = Lang.Get($"🖍 Vurgula '{preview}'", $"🖍 Highlight '{preview}'"); menuHighlight.Image = GenerateColorPreviewBitmap(pendingHlColor.Fore, pendingHlColor.Back); } }
-                else { pendingIsRemove = false; menuSearchThis.Text = Lang.Get("🔍 Bu Pencerede Ara (metin seçin)", "🔍 Search in This Window (select text first)"); menuSearchAll.Text = Lang.Get("🔍 Tüm Pencerelerde Ara (metin seçin)", "🔍 Search in All Windows (select text first)"); menuHighlight.Text = Lang.Get("🖍 Vurgula (metin seçin)", "🖍 Highlight (select text first)"); menuHighlight.Image = null; }
+                if (hasSel)
+                {
+                    string fullTerm = rtbOutput.SelectedText.Trim();
+                    string preview = fullTerm.Length > 22 ? fullTerm.Substring(0, 22) + "..." : fullTerm;
+                    menuSearchThis.Text = Lang.Get($"🔍 Bu Pencerede Ara: \"{preview}\"", $"🔍 Search in This Window: \"{preview}\"");
+                    menuSearchAll.Text = Lang.Get($"🔍 Tüm Pencerelerde Ara: \"{preview}\"", $"🔍 Search in All Windows: \"{preview}\"");
+
+                    bool alreadyHL = !string.IsNullOrEmpty(fullTerm) && _highlightRules.ContainsKey(fullTerm);
+                    menuHighlight.DropDownItems.Clear();
+
+                    if (alreadyHL)
+                    {
+                        pendingIsRemove = true;
+                        var ec = _highlightRules[fullTerm];
+                        menuHighlight.Text = Lang.Get($"🗑 Vurguyu Kaldır '{preview}'", $"🗑 Remove Highlight '{preview}'");
+                        menuHighlight.Image = GenerateColorPreviewBitmap(ec.Fore, ec.Back);
+                    }
+                    else
+                    {
+                        pendingIsRemove = false;
+                        menuHighlight.Text = Lang.Get($"🖍 Vurgula '{preview}' (Tema Seç)...", $"🖍 Highlight '{preview}' (Select Theme)...");
+                        menuHighlight.Image = null;
+                        foreach (var theme in _highlightThemes)
+                        {
+                            var item = new ToolStripMenuItem(theme.Name) { Image = GenerateColorPreviewBitmap(theme.Fore, theme.Back) };
+                            item.Click += (sender, args) =>
+                            {
+                                if (string.IsNullOrEmpty(fullTerm)) return;
+                                _highlightRules[fullTerm] = (theme.Fore, theme.Back);
+                                SaveHighlights();
+                                BuildHighlightRegex();
+                                ApplyHighlightsToAllWindows();
+                            };
+                            menuHighlight.DropDownItems.Add(item);
+                        }
+                    }
+                }
+                else
+                {
+                    pendingIsRemove = false;
+                    menuSearchThis.Text = Lang.Get("🔍 Bu Pencerede Ara (metin seçin)", "🔍 Search in This Window (select text first)");
+                    menuSearchAll.Text = Lang.Get("🔍 Tüm Pencerelerde Ara (metin seçin)", "🔍 Search in All Windows (select text first)");
+                    menuHighlight.Text = Lang.Get("🖍 Vurgula (metin seçin)", "🖍 Highlight (select text first)");
+                    menuHighlight.Image = null;
+                    menuHighlight.DropDownItems.Clear();
+                }
             };
+
+
+
             contextMenu.Items.Add(menuCopySelected); contextMenu.Items.Add(new ToolStripSeparator()); contextMenu.Items.Add(menuHighlight); contextMenu.Items.Add(new ToolStripSeparator()); contextMenu.Items.Add(menuSearchThis); contextMenu.Items.Add(menuSearchAll); contextMenu.Items.Add(new ToolStripSeparator()); contextMenu.Items.Add(menuCloseLog);
             groupBox.ContextMenuStrip = contextMenu;
             rtbOutput.ContextMenuStrip = contextMenu;
@@ -1387,6 +1706,10 @@ namespace TekDosyaSeriPort
             btnZoom.BringToFront();
             btnMinimize.BringToFront();
             btnDetach.BringToFront();
+
+            // Z-Order düzeltmesi
+            rtbWrapper.BringToFront();
+            //customScrollTrack.BringToFront();
 
             Action updateLogTexts = () =>
             {
@@ -1492,11 +1815,12 @@ namespace TekDosyaSeriPort
                 var rtb = groupBox.Controls.Find("rtbOutput", true).FirstOrDefault() as ScrollAwareRichTextBox;
                 if (rtb != null && !rtb.IsDisposed)
                 {
-                    Font boldF = new Font("Consolas", 10, FontStyle.Bold);
-                    Font regularF = new Font("Consolas", 10, FontStyle.Regular);
+                    using Font boldF = new Font("Consolas", 10, FontStyle.Bold);
+                    using Font regularF = new Font("Consolas", 10, FontStyle.Regular);
                     AppendColoredText(rtb, buffered, key, boldF, regularF, Color.FromArgb(0, 200, 220));
                     rtb.SelectionStart = rtb.TextLength;
                     rtb.ScrollToCaret();
+                    rtb.ScrollToAbsoluteBottom();
                 }
             }
         }
@@ -1744,7 +2068,7 @@ namespace TekDosyaSeriPort
                 if (TryCreatePortWindow(portName)) { _busyPorts.Remove(portName); layoutChanged = true; } else _busyPorts.Add(portName);
             }
             List<GroupBox> toRemove = _portMap.Keys.Where(box => !systemPorts.Contains(_portMap[box].PortName)).ToList();
-            foreach (var box in toRemove) { string pName = _portMap[box].PortName; if (_ignoredPorts.Contains(pName)) _ignoredPorts.Remove(pName); _busyPorts.Remove(pName); CloseSpecificPort(box, false, false); layoutChanged = true; }
+            foreach (var box in toRemove) { string pName = _portMap[box].PortName; if (_ignoredPorts.Contains(pName)) { _ignoredPorts.Remove(pName); SaveIgnoredPorts(); } _busyPorts.Remove(pName); CloseSpecificPort(box, false, false); layoutChanged = true; }
             var missingBusy = _busyPorts.Where(p => !systemPorts.Contains(p)).ToList();
             foreach (var mb in missingBusy) _busyPorts.Remove(mb);
             if (layoutChanged) RearrangeGrid();
@@ -1774,7 +2098,7 @@ namespace TekDosyaSeriPort
             if (targetBox != null) CloseSpecificPort(targetBox, true, true);
             else
             {
-                if (_ignoredPorts.Contains(portName)) _ignoredPorts.Remove(portName);
+                if (_ignoredPorts.Contains(portName)) { _ignoredPorts.Remove(portName); SaveIgnoredPorts(); }
                 if (SerialPort.GetPortNames().Contains(portName))
                 {
                     if (TryCreatePortWindow(portName)) { _busyPorts.Remove(portName); RearrangeGrid(); }
@@ -1789,10 +2113,16 @@ namespace TekDosyaSeriPort
         {
             if (_isAnimating.TryGetValue(key, out bool animating) && animating) return;
             Button? btn = null;
-            if (_minimizedBar.InvokeRequired)
-                _minimizedBar.Invoke(new Action(() => { btn = _minimizedBar.Controls.Cast<Control>().FirstOrDefault(c => c.Tag?.ToString() == key) as Button; }));
-            else
-                btn = _minimizedBar.Controls.Cast<Control>().FirstOrDefault(c => c.Tag?.ToString() == key) as Button;
+            try
+            {
+                if (_minimizedBar.IsDisposed) return;
+                if (_minimizedBar.InvokeRequired)
+                    _minimizedBar.Invoke(new Action(() => { if (!_minimizedBar.IsDisposed) btn = _minimizedBar.Controls.Cast<Control>().FirstOrDefault(c => c.Tag?.ToString() == key) as Button; }));
+                else
+                    btn = _minimizedBar.Controls.Cast<Control>().FirstOrDefault(c => c.Tag?.ToString() == key) as Button;
+            }
+            catch (ObjectDisposedException) { return; }
+            catch (InvalidOperationException) { return; }
 
             if (btn == null || btn.IsDisposed) return;
             _isAnimating[key] = true;
@@ -1807,7 +2137,8 @@ namespace TekDosyaSeriPort
                 if (btn.IsDisposed) return;
                 btn.Invoke((MethodInvoker)(() => { if (!btn.IsDisposed) btn.BackColor = originalColor; }));
             }
-            catch { }
+            catch (ObjectDisposedException) { }
+            catch (InvalidOperationException) { }
             finally { _isAnimating[key] = false; }
         }
 
@@ -1850,13 +2181,14 @@ namespace TekDosyaSeriPort
             groupBox.MouseUp += (s, e) => { if (_dragSource != null) { _dragSource.BackColor = _originalDragSourceColor; _dragSource = null; } if (_dragTarget != null) { _dragTarget.BackColor = _originalDragTargetColor; _dragTarget = null; } };
 
             // FIX #4: RTB Dock=Fill kullan, beyaz alan yok
-            Panel rtbWrapper = new Panel { Dock = DockStyle.Fill, BackColor = Color.Black };
+            // RTB — FIX #4: RtbWrapper sağ kenar beyaz alan sorunu çözüldü
+            // RTB — 10px Sol Boşluk (Padding) Eklendi
+            Panel rtbWrapper = new Panel { Dock = DockStyle.Fill, BackColor = Color.Black, Padding = new Padding(10, 5, 0, 5) };
             ScrollAwareRichTextBox rtbOutput = new ScrollAwareRichTextBox
             {
                 Name = "rtbOutput",
                 BackColor = Color.Black,
                 ForeColor = Color.LimeGreen,
-                // FIX #8: Emoji destekli font
                 Font = IsFontAvailable("Segoe UI Emoji")
                     ? new Font("Segoe UI Emoji", 10f, FontStyle.Regular)
                     : new Font("Consolas", 10f, FontStyle.Regular),
@@ -1864,45 +2196,48 @@ namespace TekDosyaSeriPort
                 BorderStyle = BorderStyle.None,
                 HideSelection = false,
                 ScrollBars = RichTextBoxScrollBars.Vertical,
-                Dock = DockStyle.Fill  // FIX #4
+                Dock = DockStyle.Fill
             };
+
+            // Arka plan rengi senkronizasyonu
+            rtbOutput.BackColorChanged += (s, e) => rtbWrapper.BackColor = rtbOutput.BackColor;
             rtbWrapper.Controls.Add(rtbOutput);
 
-            Panel customScrollTrack = new Panel { Dock = DockStyle.Right, Width = 14, BackColor = Color.FromArgb(204, 30, 30, 35), Padding = new Padding(2) };
-            Panel customScrollThumb = new Panel { Width = 10, Height = 30, BackColor = Color.FromArgb(100, 100, 110), Cursor = Cursors.Hand, Left = 2, Top = 2 };
-            customScrollTrack.Controls.Add(customScrollThumb);
+            //Panel customScrollTrack = new Panel { Dock = DockStyle.Right, Width = 14, BackColor = Color.FromArgb(204, 30, 30, 35), Padding = new Padding(2) };
+            //Panel customScrollThumb = new Panel { Width = 10, Height = 30, BackColor = Color.FromArgb(100, 100, 110), Cursor = Cursors.Hand, Left = 2, Top = 2 };
+            //customScrollTrack.Controls.Add(customScrollThumb);
 
-            bool isThumbDragging = false; int thumbDragStartY = 0, thumbStartTop = 0;
-            Action updateScroll = () =>
-            {
-                if (rtbOutput.IsDisposed || customScrollTrack.IsDisposed) return;
-                if (isThumbDragging) return;
-                GetScrollRange(rtbOutput.Handle, 1, out _, out int max);
-                int pos = GetScrollPos(rtbOutput.Handle, 1), clientH = rtbOutput.ClientSize.Height;
-                if (max <= clientH || clientH == 0) { customScrollTrack.Visible = false; return; }
-                customScrollTrack.Visible = true;
-                float ratio = (float)clientH / max;
-                int thumbH = Math.Max(20, (int)(customScrollTrack.Height * ratio));
-                customScrollThumb.Height = thumbH;
-                float scrollRatio = max > clientH ? (float)pos / (max - clientH) : 0;
-                scrollRatio = Math.Max(0, Math.Min(1, scrollRatio));
-                int maxTop = customScrollTrack.Height - thumbH - customScrollTrack.Padding.Bottom;
-                customScrollThumb.Top = customScrollTrack.Padding.Top + (int)(scrollRatio * (maxTop - customScrollTrack.Padding.Top));
-            };
-            rtbOutput.Scrolled += (s, e) => updateScroll();
-            rtbOutput.TextChanged += (s, e) => updateScroll();
-            groupBox.SizeChanged += (s, e) => updateScroll();
-            customScrollThumb.MouseDown += (s, e) => { if (e.Button == MouseButtons.Left) { isThumbDragging = true; thumbDragStartY = Cursor.Position.Y; thumbStartTop = customScrollThumb.Top; customScrollThumb.BackColor = Color.FromArgb(140, 140, 150); } };
-            customScrollThumb.MouseUp += (s, e) => { isThumbDragging = false; customScrollThumb.BackColor = Color.FromArgb(100, 100, 110); rtbOutput.Refresh(); };
-            customScrollThumb.MouseMove += (s, e) =>
-            {
-                if (!isThumbDragging) return;
-                int delta = Cursor.Position.Y - thumbDragStartY, newTop = thumbStartTop + delta, maxTop = customScrollTrack.Height - customScrollThumb.Height - customScrollTrack.Padding.Bottom;
-                newTop = Math.Max(customScrollTrack.Padding.Top, Math.Min(newTop, maxTop));
-                customScrollThumb.Top = newTop;
-                float scrollRatio = (float)(newTop - customScrollTrack.Padding.Top) / Math.Max(1, maxTop - customScrollTrack.Padding.Top);
-                if (rtbOutput.TextLength > 0) { int totalLines = rtbOutput.GetLineFromCharIndex(rtbOutput.TextLength - 1) + 1, targetLine = (int)(totalLines * scrollRatio); targetLine = Math.Max(0, Math.Min(targetLine, totalLines - 1)); int targetIndex = rtbOutput.GetFirstCharIndexFromLine(targetLine); if (targetIndex >= 0) { rtbOutput.SelectionStart = targetIndex; rtbOutput.SelectionLength = 0; rtbOutput.ScrollToCaret(); rtbOutput.Refresh(); } }
-            };
+            //bool isThumbDragging = false; int thumbDragStartY = 0, thumbStartTop = 0;
+            //Action updateScroll = () =>
+            //{
+            //    if (rtbOutput.IsDisposed || customScrollTrack.IsDisposed) return;
+            //    if (isThumbDragging) return;
+            //    GetScrollRange(rtbOutput.Handle, 1, out _, out int max);
+            //    int pos = GetScrollPos(rtbOutput.Handle, 1), clientH = rtbOutput.ClientSize.Height;
+            //    if (max <= clientH || clientH == 0) { customScrollTrack.Visible = false; return; }
+            //    customScrollTrack.Visible = true;
+            //    float ratio = (float)clientH / max;
+            //    int thumbH = Math.Max(20, (int)(customScrollTrack.Height * ratio));
+            //    customScrollThumb.Height = thumbH;
+            //    float scrollRatio = max > clientH ? (float)pos / (max - clientH) : 0;
+            //    scrollRatio = Math.Max(0, Math.Min(1, scrollRatio));
+            //    int maxTop = customScrollTrack.Height - thumbH - customScrollTrack.Padding.Bottom;
+            //    customScrollThumb.Top = customScrollTrack.Padding.Top + (int)(scrollRatio * (maxTop - customScrollTrack.Padding.Top));
+            //};
+            //rtbOutput.Scrolled += (s, e) => updateScroll();
+            //rtbOutput.TextChanged += (s, e) => updateScroll();
+            //groupBox.SizeChanged += (s, e) => updateScroll();
+            //customScrollThumb.MouseDown += (s, e) => { if (e.Button == MouseButtons.Left) { isThumbDragging = true; thumbDragStartY = Cursor.Position.Y; thumbStartTop = customScrollThumb.Top; customScrollThumb.BackColor = Color.FromArgb(140, 140, 150); } };
+            //customScrollThumb.MouseUp += (s, e) => { isThumbDragging = false; customScrollThumb.BackColor = Color.FromArgb(100, 100, 110); rtbOutput.Refresh(); };
+            //customScrollThumb.MouseMove += (s, e) =>
+            //{
+            //    if (!isThumbDragging) return;
+            //    int delta = Cursor.Position.Y - thumbDragStartY, newTop = thumbStartTop + delta, maxTop = customScrollTrack.Height - customScrollThumb.Height - customScrollTrack.Padding.Bottom;
+            //    newTop = Math.Max(customScrollTrack.Padding.Top, Math.Min(newTop, maxTop));
+            //    customScrollThumb.Top = newTop;
+            //    float scrollRatio = (float)(newTop - customScrollTrack.Padding.Top) / Math.Max(1, maxTop - customScrollTrack.Padding.Top);
+            //    if (rtbOutput.TextLength > 0) { int totalLines = rtbOutput.GetLineFromCharIndex(rtbOutput.TextLength - 1) + 1, targetLine = (int)(totalLines * scrollRatio); targetLine = Math.Max(0, Math.Min(targetLine, totalLines - 1)); int targetIndex = rtbOutput.GetFirstCharIndexFromLine(targetLine); if (targetIndex >= 0) { rtbOutput.SelectionStart = targetIndex; rtbOutput.SelectionLength = 0; rtbOutput.ScrollToCaret(); rtbOutput.Refresh(); } }
+            //};
 
             Font boldFont = new Font("Consolas", 10, FontStyle.Bold);
             Font regularFont = new Font("Consolas", 10, FontStyle.Regular);
@@ -1940,13 +2275,18 @@ namespace TekDosyaSeriPort
             _windowSearchActions[portName] = (term) =>
             {
                 if (groupBox.IsDisposed || rtbOutput.IsDisposed) return;
-                groupBox.BeginInvoke((MethodInvoker)(() =>
+                try
                 {
-                    if (groupBox.IsDisposed || searchPanel.IsDisposed) return;
-                    searchPanel.Visible = true; searchIndex = -1;
-                    if (txtSearch.Text != term) txtSearch.Text = term; else DoSearch(true);
-                    txtSearch.Focus(); txtSearch.SelectAll();
-                }));
+                    groupBox.BeginInvoke((MethodInvoker)(() =>
+                    {
+                        if (groupBox.IsDisposed || searchPanel.IsDisposed) return;
+                        searchPanel.Visible = true; searchIndex = -1;
+                        if (txtSearch.Text != term) txtSearch.Text = term; else DoSearch(true);
+                        txtSearch.Focus(); txtSearch.SelectAll();
+                    }));
+                }
+                catch (ObjectDisposedException) { /* GroupBox dispose edilmiş olabilir */ }
+                catch (InvalidOperationException) { /* Handle henüz oluşturulmamış olabilir */ }
             };
 
             Panel topSpacer = new Panel { Dock = DockStyle.Top, Height = 5, BackColor = Color.Transparent };
@@ -1954,12 +2294,32 @@ namespace TekDosyaSeriPort
             string sessionFileName = $"{portName}_{DateTime.Now:yyyy-MM-dd_HH-mm-ss}.txt";
 
             Button btnCopy = MakeButton("📋 Kopyala", 80);
-            btnCopy.Click += (s, e) => { if (!string.IsNullOrEmpty(rtbOutput.Text)) Clipboard.SetText(rtbOutput.Text); };
+            _toolTip.SetToolTip(btnCopy, Lang.Get("Tüm ekran içeriğini panoya kopyala", "Copy all screen content to clipboard"));
+            btnCopy.Click += (s, e) =>
+            {
+                if (!string.IsNullOrEmpty(rtbOutput.Text))
+                {
+                    Clipboard.SetText(rtbOutput.Text);
+                    // UX: Kopyalama geri bildirimi — buton rengi kısa süre yeşile döner
+                    Color origColor = btnCopy.BackColor;
+                    btnCopy.BackColor = Color.FromArgb(0, 130, 60);
+                    btnCopy.Text = Lang.Get("✅ Kopyalandı", "✅ Copied");
+                    var feedbackTimer = new System.Windows.Forms.Timer { Interval = 1200 };
+                    feedbackTimer.Tick += (ft, fe) => { feedbackTimer.Stop(); feedbackTimer.Dispose(); if (!btnCopy.IsDisposed) { btnCopy.BackColor = origColor; btnCopy.Text = Lang.Get("📋 Kopyala", "📋 Copy"); } };
+                    feedbackTimer.Start();
+                }
+            };
             Button btnSaveAs = MakeButton("💾 Kaydet", 70);
+            _toolTip.SetToolTip(btnSaveAs, Lang.Get("Ekran içeriğini dosyaya kaydet", "Save screen content to file"));
             btnSaveAs.Click += (s, e) => { using SaveFileDialog sfd = new SaveFileDialog { Title = Lang.Get($"{portName} - Farklı Kaydet", $"{portName} - Save As"), Filter = Lang.Get("Metin Dosyası (*.txt)|*.txt|Tüm Dosyalar (*.*)|*.*", "Text File (*.txt)|*.txt|All Files (*.*)|*.*"), FileName = $"{portName}_{DateTime.Now:yyyy-MM-dd_HH-mm-ss}", InitialDirectory = _logFolderPath }; if (sfd.ShowDialog() == DialogResult.OK) { try { File.WriteAllText(sfd.FileName, rtbOutput.Text); MessageBox.Show(Lang.Get("Dosya kaydedildi.", "File saved."), Lang.Get("Bilgi", "Info"), MessageBoxButtons.OK, MessageBoxIcon.Information); } catch (Exception ex) { MessageBox.Show(Lang.Get($"Kayıt hatası: {ex.Message}", $"Save error: {ex.Message}"), Lang.Get("Hata", "Error"), MessageBoxButtons.OK, MessageBoxIcon.Error); } } };
             Button btnClear = MakeButton("🗑 Temizle", 70);
-            btnClear.Click += (s, e) => { rtbOutput.Clear(); _atLineStart[portName] = true; if (_frozenBuffer.ContainsKey(portName)) _frozenBuffer[portName].Clear(); };
+            _toolTip.SetToolTip(btnClear, Lang.Get("Ekrandaki tüm veriyi sil (geri alınamaz)", "Clear all data on screen (cannot be undone)"));
+            btnClear.Click += (s, e) =>
+            {
+                rtbOutput.Clear(); _atLineStart[portName] = true; if (_frozenBuffer.ContainsKey(portName)) _frozenBuffer[portName].Clear();
+            };
             Button btnFreeze = MakeButton("⏸ Dondur", 70);
+            _toolTip.SetToolTip(btnFreeze, Lang.Get("Ekranı dondur — veri arka planda birikir", "Freeze display — data buffers in background"));
             btnFreeze.Click += (s, e) =>
             {
                 _scrollFrozen[portName] = !_scrollFrozen[portName];
@@ -1970,8 +2330,16 @@ namespace TekDosyaSeriPort
             {
                 if (!_frozenBuffer.ContainsKey(portName)) return;
                 string buffered = _frozenBuffer[portName].ToString(); _frozenBuffer[portName].Clear();
-                if (buffered.Length > 0) AppendColoredText(rtbOutput, buffered, portName, boldFont, regularFont, tsColor);
-                rtbOutput.SelectionStart = rtbOutput.TextLength; rtbOutput.ScrollToCaret();
+                if (buffered.Length > 0)
+                {
+                    AppendColoredText(rtbOutput, buffered, portName, boldFont, regularFont, tsColor);
+                    rtbOutput.SelectionStart = rtbOutput.TextLength;
+                    rtbOutput.ScrollToCaret();
+                    // FIX: Emoji/farklı font yüksekliğinde ScrollToCaret yetmeyebilir
+                    rtbOutput.BeginInvoke(new Action(() => {
+                        if (!rtbOutput.IsDisposed) rtbOutput.ScrollToAbsoluteBottom();
+                    }));
+                }
             }
 
             // FIX #2: Durdur / Devam Et butonu
@@ -2009,12 +2377,13 @@ namespace TekDosyaSeriPort
                         int baud = spOld.BaudRate;
                         try
                         {
+                            // FIX: Önce pause flag'ını kaldır ki port açılır açılmaz veri alabilsin
+                            _portPaused[portName] = false;
                             if (!spOld.IsOpen)
                             {
                                 spOld.Open();
                                 spOld.DiscardInBuffer();
                             }
-                            _portPaused[portName] = false;
                             btnPause.Text = Lang.Get("⏹ Durdur", "⏹ Pause");
                             btnPause.BackColor = Color.FromArgb(120, 50, 0);
                             btnPause.FlatAppearance.MouseOverBackColor = Color.FromArgb(150, 70, 10);
@@ -2034,12 +2403,123 @@ namespace TekDosyaSeriPort
             };
 
             Button btnLog = MakeButton("🔴 Log Kapalı", 95);
+            _toolTip.SetToolTip(btnLog, Lang.Get("Veriyi dosyaya kaydetmeyi aç/kapat", "Toggle saving data to log file"));
             btnLog.Click += (s, e) => { _loggingEnabled[portName] = !_loggingEnabled[portName]; if (_loggingEnabled[portName]) { btnLog.Text = Lang.Get("🟢 Log Aktif", "🟢 Log On"); btnLog.BackColor = Color.FromArgb(30, 130, 30); } else { btnLog.Text = Lang.Get("🔴 Log Kapalı", "🔴 Log Off"); btnLog.BackColor = Color.FromArgb(75, 75, 78); } };
             rtbOutput.ScrolledToBottom += (s, e) => { if (!_scrollFrozen.GetValueOrDefault(portName)) return; _scrollFrozen[portName] = false; btnFreeze.Text = Lang.Get("⏸ Dondur", "⏸ Freeze"); btnFreeze.BackColor = Color.FromArgb(70, 70, 30); FlushBuffer(); };
+
+            // === SERBEST BIRAK / RELEASE — diğer programa port izni ver, boşalınca otomatik geri bağlan ===
+            Button btnRelease = MakeButton(Lang.Get("🔓 Serbest", "🔓 Release"), 80);
+            btnRelease.Tag = "btnRelease";
+            _toolTip.SetToolTip(btnRelease, Lang.Get("Portu serbest bırak — başka program kullansın, bitince otomatik bağlanır\n(Bilinen programlar algılandığında otomatik çalışır)", "Release port for other apps — auto-reconnects when available\n(Auto-triggers when known programs are detected)"));
+            System.Windows.Forms.Timer? reconnectTimer = null;
+            bool isReleased = false;
+
+            Action stopReconnect = () =>
+            {
+                if (reconnectTimer != null) { reconnectTimer.Stop(); reconnectTimer.Dispose(); reconnectTimer = null; }
+            };
+
+            btnRelease.Click += (s, e) =>
+            {
+                if (!isReleased)
+                {
+                    // SERBEST BIRAK
+                    isReleased = true;
+                    _portPaused[portName] = true;
+                    if (_portMap.TryGetValue(groupBox, out SerialPort? spRel) && spRel != null)
+                    {
+                        try { if (spRel.IsOpen) spRel.Close(); } catch { }
+                    }
+                    btnRelease.Text = Lang.Get("🔒 Geri Al", "🔒 Reclaim");
+                    btnRelease.BackColor = Color.FromArgb(140, 80, 180);
+                    groupBox.Text = $"{portName} - {Lang.Get("SERBEST", "RELEASED")}";
+                    groupBox.ForeColor = Color.FromArgb(180, 140, 220);
+
+                    // Otomatik yeniden bağlanma — 3 saniyede bir kontrol
+                    reconnectTimer = new System.Windows.Forms.Timer { Interval = 3000 };
+                    reconnectTimer.Tick += (rt, re) =>
+                    {
+                        if (!isReleased || groupBox.IsDisposed) { stopReconnect(); return; }
+                        if (!_portMap.TryGetValue(groupBox, out SerialPort? spChk) || spChk == null) { stopReconnect(); return; }
+                        try
+                        {
+                            if (!spChk.IsOpen)
+                            {
+                                spChk.Open();
+                                spChk.DiscardInBuffer();
+                            }
+                            // Başarılı — port müsait, geri bağlandık
+                            isReleased = false;
+                            _portPaused[portName] = false;
+                            stopReconnect();
+                            btnRelease.Text = Lang.Get("🔓 Serbest", "🔓 Release");
+                            btnRelease.BackColor = Color.FromArgb(75, 75, 78);
+                            int baud = spChk.BaudRate;
+                            groupBox.Text = $"{portName} - {Lang.Get("AÇIK", "ONLINE")} ({baud})";
+                            groupBox.ForeColor = Color.White;
+                        }
+                        catch (UnauthorizedAccessException) { /* başka program hâlâ kullanıyor, beklemeye devam */ }
+                        catch (System.IO.IOException) { /* port hâlâ meşgul */ }
+                        catch { /* diğer hatalar — beklemeye devam */ }
+                    };
+                    reconnectTimer.Start();
+                }
+                else
+                {
+                    // MANUEL GERİ AL
+                    isReleased = false;
+                    stopReconnect();
+                    if (_portMap.TryGetValue(groupBox, out SerialPort? spBack) && spBack != null)
+                    {
+                        try
+                        {
+                            _portPaused[portName] = false;
+                            if (!spBack.IsOpen) { spBack.Open(); spBack.DiscardInBuffer(); }
+                            int baud = spBack.BaudRate;
+                            groupBox.Text = $"{portName} - {Lang.Get("AÇIK", "ONLINE")} ({baud})";
+                            groupBox.ForeColor = Color.White;
+                        }
+                        catch (Exception ex)
+                        {
+                            // Port hâlâ meşgul — tekrar serbest moda dön
+                            isReleased = true;
+                            _portPaused[portName] = true;
+                            groupBox.Text = $"{portName} - {Lang.Get("MEŞGUL", "BUSY")}";
+                            groupBox.ForeColor = Color.FromArgb(220, 80, 80);
+                            reconnectTimer = new System.Windows.Forms.Timer { Interval = 3000 };
+                            reconnectTimer.Tick += (rt, re) =>
+                            {
+                                if (!isReleased || groupBox.IsDisposed) { stopReconnect(); return; }
+                                if (!_portMap.TryGetValue(groupBox, out SerialPort? spRetry) || spRetry == null) { stopReconnect(); return; }
+                                try
+                                {
+                                    if (!spRetry.IsOpen) { spRetry.Open(); spRetry.DiscardInBuffer(); }
+                                    isReleased = false;
+                                    _portPaused[portName] = false;
+                                    stopReconnect();
+                                    btnRelease.Text = Lang.Get("🔓 Serbest", "🔓 Release");
+                                    btnRelease.BackColor = Color.FromArgb(75, 75, 78);
+                                    int baud2 = spRetry.BaudRate;
+                                    groupBox.Text = $"{portName} - {Lang.Get("AÇIK", "ONLINE")} ({baud2})";
+                                    groupBox.ForeColor = Color.White;
+                                }
+                                catch { }
+                            };
+                            reconnectTimer.Start();
+                            return;
+                        }
+                    }
+                    btnRelease.Text = Lang.Get("🔓 Serbest", "🔓 Release");
+                    btnRelease.BackColor = Color.FromArgb(75, 75, 78);
+                }
+            };
+            // Pencere kapanırken timer temizliği
+            groupBox.Disposed += (s, e) => stopReconnect();
 
             ComboBox cboBaud = new ComboBox { Dock = DockStyle.Left, Width = 80, DropDownStyle = ComboBoxStyle.DropDownList, BackColor = Color.FromArgb(40, 40, 40), ForeColor = Color.White, Font = new Font("Segoe UI", 8f), FlatStyle = FlatStyle.Flat };
             foreach (int b in new[] { 300, 1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600 }) cboBaud.Items.Add(b);
             cboBaud.SelectedItem = 115200;
+            _toolTip.SetToolTip(cboBaud, Lang.Get("Baud hızını değiştir — port yeniden bağlanır", "Change baud rate — port reconnects"));
             Label lblBaud = new Label { Text = "Baud:", Dock = DockStyle.Left, Width = 38, ForeColor = Color.Silver, Font = new Font("Segoe UI", 8f), TextAlign = ContentAlignment.MiddleRight, Height = 22 };
             cboBaud.SelectedIndexChanged += (s, e) =>
             {
@@ -2047,8 +2527,36 @@ namespace TekDosyaSeriPort
                 SerialPort old = _portMap[groupBox]; string pName = old.PortName; int newBaud = (int)(cboBaud.SelectedItem ?? 115200);
                 if (old.IsOpen) try { old.Close(); } catch { }
                 old.Dispose(); _portMap.Remove(groupBox);
-                try { SerialPort np = new SerialPort(pName, newBaud, Parity.None, 8, StopBits.One); np.DataReceived += (snd, ev) => { SerialPort sp2 = (SerialPort)snd; try { if (_portPaused.GetValueOrDefault(portName)) return; if (!sp2.IsOpen) return; string data = sp2.ReadExisting(); if (!string.IsNullOrEmpty(data)) lock (_receiveBuffer) _receiveBuffer[portName].Append(data); } catch { } }; np.Open(); _portMap[groupBox] = np; groupBox.BeginInvoke((MethodInvoker)delegate { groupBox.Text = $"{pName} - {Lang.Get("AÇIK", "ONLINE")} ({newBaud})"; rtbOutput.Clear(); _atLineStart[portName] = true; if (_frozenBuffer.ContainsKey(portName)) _frozenBuffer[portName].Clear(); }); }
-                catch (Exception ex) { rtbOutput.BeginInvoke((MethodInvoker)delegate { rtbOutput.AppendText($"\n[HATA/ERR] : {ex.Message}\n"); groupBox.Text = $"{pName} - ERR"; }); }
+                try {
+                    SerialPort np = new SerialPort(pName, newBaud, Parity.None, 8, StopBits.One);
+                    np.DataReceived += (snd, ev) => {
+                        SerialPort sp2 = (SerialPort)snd;
+                        try {
+                            if (_portPaused.GetValueOrDefault(portName)) return;
+                            if (!sp2.IsOpen) return;
+                            string data;
+                            try { data = sp2.ReadExisting(); }
+                            catch (InvalidOperationException) { return; }
+                            catch (System.IO.IOException) { return; }
+                            if (!string.IsNullOrEmpty(data))
+                                lock (_receiveBuffer) { if (_receiveBuffer.ContainsKey(portName)) _receiveBuffer[portName].Append(data); }
+                        } catch { }
+                    };
+                    np.Open();
+                    _portMap[groupBox] = np;
+                    if (!groupBox.IsDisposed) groupBox.BeginInvoke((MethodInvoker)delegate {
+                        if (groupBox.IsDisposed) return;
+                        groupBox.Text = $"{pName} - {Lang.Get("AÇIK", "ONLINE")} ({newBaud})";
+                        rtbOutput.Clear(); _atLineStart[portName] = true;
+                        if (_frozenBuffer.ContainsKey(portName)) _frozenBuffer[portName].Clear();
+                    });
+                }
+                catch (Exception ex) {
+                    if (!groupBox.IsDisposed) try { groupBox.BeginInvoke((MethodInvoker)delegate {
+                        if (rtbOutput.IsDisposed) return;
+                        rtbOutput.AppendText($"\n[HATA/ERR] : {ex.Message}\n"); groupBox.Text = $"{pName} - ERR";
+                    }); } catch (ObjectDisposedException) { }
+                }
             };
 
             Panel sendPanel = new Panel { Dock = DockStyle.Bottom, Height = 30, BackColor = Color.FromArgb(25, 25, 45), Padding = new Padding(4), Visible = false };
@@ -2065,7 +2573,16 @@ namespace TekDosyaSeriPort
                 if (_portPaused.GetValueOrDefault(portName)) { MessageBox.Show(Lang.Get("Port durdurulmuş durumda. Önce 'Devam Et' butonuna basın.", "Port is paused. Press 'Resume' first."), Lang.Get("Bilgi", "Info"), MessageBoxButtons.OK, MessageBoxIcon.Information); return; }
                 if (_portMap.TryGetValue(groupBox, out SerialPort? sp) && sp != null && sp.IsOpen)
                 {
-                    try { sp.Write(text + "\r\n"); rtbOutput.BeginInvoke((MethodInvoker)(() => { int sStart = rtbOutput.SelectionStart, sLen = rtbOutput.SelectionLength; bool hasSel = sLen > 0; if (hasSel) SendMessage(rtbOutput.Handle, 0x000B, IntPtr.Zero, IntPtr.Zero); rtbOutput.SelectionStart = rtbOutput.TextLength; rtbOutput.SelectionLength = 0; rtbOutput.SelectionColor = Color.Orange; rtbOutput.SelectionFont = boldFont; string ts2 = DateTime.Now.ToString("HH:mm:ss.fff"); rtbOutput.AppendText($"\n[{ts2}] [TX] {text}\n"); _atLineStart[portName] = true; if (hasSel) { rtbOutput.SelectionStart = sStart; rtbOutput.SelectionLength = sLen; SendMessage(rtbOutput.Handle, 0x000B, new IntPtr(1), IntPtr.Zero); rtbOutput.Invalidate(); } else rtbOutput.ScrollToCaret(); })); if (cmdHistory.Count == 0 || cmdHistory.Last() != text) cmdHistory.Add(text); historyIdx = cmdHistory.Count; txtCommand.Clear(); }
+                    try { sp.Write(text + "\r\n"); rtbOutput.BeginInvoke((MethodInvoker)(() => { int sStart = rtbOutput.SelectionStart, sLen = rtbOutput.SelectionLength; bool hasSel = sLen > 0; if (hasSel) SendMessage(rtbOutput.Handle, 0x000B, IntPtr.Zero, IntPtr.Zero); rtbOutput.SelectionStart = rtbOutput.TextLength; rtbOutput.SelectionLength = 0; rtbOutput.SelectionColor = Color.Orange; rtbOutput.SelectionFont = boldFont; string ts2 = DateTime.Now.ToString("HH:mm:ss.fff"); rtbOutput.AppendText($"\n[{ts2}] [TX] {text}\n"); _atLineStart[portName] = true; if (hasSel) { rtbOutput.SelectionStart = sStart; rtbOutput.SelectionLength = sLen; SendMessage(rtbOutput.Handle, 0x000B, new IntPtr(1), IntPtr.Zero); rtbOutput.Invalidate(); }
+
+                        else
+                        {
+                            rtbOutput.ScrollToCaret();
+                            rtbOutput.BeginInvoke(new Action(() => { if (!rtbOutput.IsDisposed) rtbOutput.ScrollToAbsoluteBottom(); }));
+                        }
+                    }));
+                        if (cmdHistory.Count == 0 || cmdHistory.Last() != text) cmdHistory.Add(text); historyIdx = cmdHistory.Count; txtCommand.Clear();
+                    }
                     catch (Exception ex) { MessageBox.Show(ex.Message, "Error", MessageBoxButtons.OK, MessageBoxIcon.Error); }
                 }
             };
@@ -2073,10 +2590,11 @@ namespace TekDosyaSeriPort
             txtCommand.KeyDown += (s, e) => { if (e.KeyCode == Keys.Enter) { sendAction(); e.Handled = true; e.SuppressKeyPress = true; } else if (e.KeyCode == Keys.Up) { if (cmdHistory.Count > 0 && historyIdx > 0) { historyIdx--; txtCommand.Text = cmdHistory[historyIdx]; txtCommand.SelectionStart = txtCommand.Text.Length; } e.Handled = true; } else if (e.KeyCode == Keys.Down) { if (cmdHistory.Count > 0 && historyIdx < cmdHistory.Count - 1) { historyIdx++; txtCommand.Text = cmdHistory[historyIdx]; txtCommand.SelectionStart = txtCommand.Text.Length; } else { historyIdx = cmdHistory.Count; txtCommand.Text = ""; } e.Handled = true; } };
 
             Button btnToggleSend = MakeButton("⌨ Komut", 75);
+            _toolTip.SetToolTip(btnToggleSend, Lang.Get("Seri porta komut gönderme panelini aç/kapat", "Toggle command input panel for serial port"));
             btnToggleSend.Click += (s, e) => { sendPanel.Visible = !sendPanel.Visible; if (sendPanel.Visible) { btnToggleSend.BackColor = Color.FromArgb(60, 60, 100); txtCommand.Focus(); } else btnToggleSend.BackColor = Color.FromArgb(75, 75, 78); };
 
             // FIX #2: Durdur butonu bottomPanel'a eklendi
-            bottomPanel.Controls.AddRange(new Control[] { btnCopy, btnSaveAs, btnClear, btnToggleSend, btnFreeze, btnPause, btnLog, cboBaud, lblBaud });
+            bottomPanel.Controls.AddRange(new Control[] { btnCopy, btnSaveAs, btnClear, btnToggleSend, btnFreeze, btnPause, btnRelease, btnLog, cboBaud, lblBaud });
 
             Button btnSmartSave = MakeButton("💾 Kaydet", 80);
             btnSmartSave.BackColor = Color.FromArgb(0, 100, 60); btnSmartSave.Visible = false;
@@ -2092,7 +2610,7 @@ namespace TekDosyaSeriPort
             cboSize.SelectedItem = 10;
 
             void CheckProfileState() { if (groupBox.IsDisposed) return; string currentData = SerializeProfile(rtbOutput, cboFont, cboSize, tsColor); var profiles = LoadProfiles(); btnSmartSave.Visible = !profiles.Values.Contains(currentData); }
-            void ApplyFont() { string fontName = cboFont.SelectedItem?.ToString() ?? "Consolas"; int fontSize = cboSize.SelectedItem is int sz ? sz : 10; regularFont = new Font(fontName, fontSize, FontStyle.Regular); boldFont = new Font(fontName, fontSize, FontStyle.Bold); rtbOutput.Font = regularFont; CheckProfileState(); }
+            void ApplyFont() { string fontName = cboFont.SelectedItem?.ToString() ?? "Consolas"; int fontSize = cboSize.SelectedItem is int sz ? sz : 10; var oldRegular = regularFont; var oldBold = boldFont; regularFont = new Font(fontName, fontSize, FontStyle.Regular); boldFont = new Font(fontName, fontSize, FontStyle.Bold); rtbOutput.Font = regularFont; oldRegular?.Dispose(); oldBold?.Dispose(); CheckProfileState(); }
             cboFont.SelectedIndexChanged += (s, e) => ApplyFont(); cboSize.SelectedIndexChanged += (s, e) => ApplyFont();
 
             Button btnTextColor2 = new Button { Width = 20, Height = 20, BackColor = rtbOutput.ForeColor, FlatStyle = FlatStyle.Flat, Cursor = Cursors.Hand, Dock = DockStyle.Left }; btnTextColor2.FlatAppearance.BorderColor = Color.Gray;
@@ -2164,10 +2682,10 @@ namespace TekDosyaSeriPort
             settingsPanel.Controls.Add(settingsRow2); settingsPanel.Controls.Add(settingsRow1);
 
             Button btnSettings = MakeButton("⚙ Görünüm", 85);
+            _toolTip.SetToolTip(btnSettings, Lang.Get("Yazı tipi, renk ve profil ayarları", "Font, color and profile settings"));
             btnSettings.Click += (s, e) => { settingsPanel.Visible = !settingsPanel.Visible; if (settingsPanel.Visible) btnSettings.BackColor = Color.FromArgb(60, 60, 100); else btnSettings.BackColor = Color.FromArgb(75, 75, 78); };
             bottomPanel.Controls.Add(btnSettings);
 
-            (Color Fore, Color Back) pendingHlColor = GenerateRandomHighlightColor();
             bool pendingIsRemove = false;
             ContextMenuStrip contextMenu = new ContextMenuStrip();
             ToolStripMenuItem menuCopySelected = new ToolStripMenuItem("📋  Kopyala") { Font = new Font("Segoe UI", 9.5f, FontStyle.Bold), ForeColor = Color.Black };
@@ -2177,13 +2695,58 @@ namespace TekDosyaSeriPort
             ToolStripMenuItem menuSearchAll = new ToolStripMenuItem { Font = new Font("Segoe UI", 9.5f, FontStyle.Bold), ForeColor = Color.Black };
             menuSearchAll.Click += (s, e) => { string term = rtbOutput.SelectedText.Trim(); if (string.IsNullOrEmpty(term)) return; foreach (var action in _windowSearchActions.Values.ToList()) action(term); };
             ToolStripMenuItem menuHighlight = new ToolStripMenuItem { Font = new Font("Segoe UI", 9.5f, FontStyle.Bold), ForeColor = Color.Black, ImageScaling = ToolStripItemImageScaling.None };
-            menuHighlight.Click += (s, e) => { string term = rtbOutput.SelectedText.Trim(); if (string.IsNullOrEmpty(term)) return; if (pendingIsRemove) { _highlightRules.Remove(term); SaveHighlights(); BuildHighlightRegex(); RemoveWordHighlightFromAllWindows(term); } else { _highlightRules[term] = pendingHlColor; SaveHighlights(); BuildHighlightRegex(); ApplyHighlightsToAllWindows(); } };
+            menuHighlight.Click += (s, e) => { if (pendingIsRemove) { string term = rtbOutput.SelectedText.Trim(); if (string.IsNullOrEmpty(term)) return; _highlightRules.Remove(term); SaveHighlights(); BuildHighlightRegex(); RemoveWordHighlightFromAllWindows(term); } };
             contextMenu.Opening += (s, e) =>
             {
                 bool hasSelection = rtbOutput.SelectionLength > 0; menuSearchThis.Enabled = hasSelection; menuSearchAll.Enabled = hasSelection; menuHighlight.Enabled = hasSelection;
-                if (hasSelection) { string fullTerm = rtbOutput.SelectedText.Trim(); string preview = fullTerm.Length > 22 ? fullTerm.Substring(0, 22) + "..." : fullTerm; menuSearchThis.Text = Lang.Get($"🔍 Bu Pencerede Ara: \"{preview}\"", $"🔍 Search in This Window: \"{preview}\""); menuSearchAll.Text = Lang.Get($"🔍 Tüm Pencerelerde Ara: \"{preview}\"", $"🔍 Search in All Windows: \"{preview}\""); bool alreadyHighlighted = !string.IsNullOrEmpty(fullTerm) && _highlightRules.ContainsKey(fullTerm); if (alreadyHighlighted) { pendingIsRemove = true; var ec = _highlightRules[fullTerm]; menuHighlight.Text = Lang.Get($"🗑 Vurguyu Kaldır '{preview}'", $"🗑 Remove Highlight '{preview}'"); menuHighlight.Image = GenerateColorPreviewBitmap(ec.Fore, ec.Back); } else { pendingIsRemove = false; pendingHlColor = GenerateRandomHighlightColor(); menuHighlight.Text = Lang.Get($"🖍 Vurgula '{preview}'", $"🖍 Highlight '{preview}'"); menuHighlight.Image = GenerateColorPreviewBitmap(pendingHlColor.Fore, pendingHlColor.Back); } }
-                else { pendingIsRemove = false; menuSearchThis.Text = Lang.Get("🔍 Bu Pencerede Ara (metin seçin)", "🔍 Search in This Window (select text first)"); menuSearchAll.Text = Lang.Get("🔍 Tüm Pencerelerde Ara (metin seçin)", "🔍 Search in All Windows (select text first)"); menuHighlight.Text = Lang.Get("🖍 Vurgula (metin seçin)", "🖍 Highlight (select text first)"); menuHighlight.Image = null; }
+                if (hasSelection)
+                {
+                    string fullTerm = rtbOutput.SelectedText.Trim();
+                    string preview = fullTerm.Length > 22 ? fullTerm.Substring(0, 22) + "..." : fullTerm;
+                    menuSearchThis.Text = Lang.Get($"🔍 Bu Pencerede Ara: \"{preview}\"", $"🔍 Search in This Window: \"{preview}\"");
+                    menuSearchAll.Text = Lang.Get($"🔍 Tüm Pencerelerde Ara: \"{preview}\"", $"🔍 Search in All Windows: \"{preview}\"");
+
+                    bool alreadyHighlighted = !string.IsNullOrEmpty(fullTerm) && _highlightRules.ContainsKey(fullTerm);
+                    menuHighlight.DropDownItems.Clear();
+
+                    if (alreadyHighlighted)
+                    {
+                        pendingIsRemove = true;
+                        var ec = _highlightRules[fullTerm];
+                        menuHighlight.Text = Lang.Get($"🗑 Vurguyu Kaldır '{preview}'", $"🗑 Remove Highlight '{preview}'");
+                        menuHighlight.Image = GenerateColorPreviewBitmap(ec.Fore, ec.Back);
+                    }
+                    else
+                    {
+                        pendingIsRemove = false;
+                        menuHighlight.Text = Lang.Get($"🖍 Vurgula '{preview}' (Tema Seç)...", $"🖍 Highlight '{preview}' (Select Theme)...");
+                        menuHighlight.Image = null;
+                        foreach (var theme in _highlightThemes)
+                        {
+                            var item = new ToolStripMenuItem(theme.Name) { Image = GenerateColorPreviewBitmap(theme.Fore, theme.Back) };
+                            item.Click += (sender, args) =>
+                            {
+                                if (string.IsNullOrEmpty(fullTerm)) return;
+                                _highlightRules[fullTerm] = (theme.Fore, theme.Back);
+                                SaveHighlights();
+                                BuildHighlightRegex();
+                                ApplyHighlightsToAllWindows();
+                            };
+                            menuHighlight.DropDownItems.Add(item);
+                        }
+                    }
+                }
+                else
+                {
+                    pendingIsRemove = false;
+                    menuSearchThis.Text = Lang.Get("🔍 Bu Pencerede Ara (metin seçin)", "🔍 Search in This Window (select text first)");
+                    menuSearchAll.Text = Lang.Get("🔍 Tüm Pencerelerde Ara (metin seçin)", "🔍 Search in All Windows (select text first)");
+                    menuHighlight.Text = Lang.Get("🖍 Vurgula (metin seçin)", "🖍 Highlight (select text first)");
+                    menuHighlight.Image = null;
+                    menuHighlight.DropDownItems.Clear();
+                }
             };
+
             ToolStripMenuItem menuCloseIgnored = new ToolStripMenuItem();
             ToolStripMenuItem menuLogDir = new ToolStripMenuItem();
             contextMenu.Items.Add(menuCopySelected); contextMenu.Items.Add(new ToolStripSeparator()); contextMenu.Items.Add(menuHighlight); contextMenu.Items.Add(new ToolStripSeparator()); contextMenu.Items.Add(menuSearchThis); contextMenu.Items.Add(menuSearchAll); contextMenu.Items.Add(new ToolStripSeparator()); contextMenu.Items.Add(menuCloseIgnored); contextMenu.Items.Add(new ToolStripSeparator()); contextMenu.Items.Add(menuLogDir);
@@ -2247,7 +2810,7 @@ namespace TekDosyaSeriPort
             btnMinimize.Location = new Point(groupBox.Width - 80, 1);
             btnDetach.Location = new Point(groupBox.Width - 106, 1);
 
-            groupBox.Controls.Add(customScrollTrack);
+            //groupBox.Controls.Add(customScrollTrack);
             groupBox.Controls.Add(rtbWrapper);
             groupBox.Controls.Add(searchPanel);
             groupBox.Controls.Add(topSpacer);
@@ -2262,8 +2825,11 @@ namespace TekDosyaSeriPort
             groupBox.Controls.Add(btnZoom);
             groupBox.Controls.Add(btnClose);
 
-            customScrollTrack.BringToFront();
+          //  customScrollTrack.BringToFront();
             btnClose.BringToFront(); btnZoom.BringToFront(); btnMinimize.BringToFront(); btnDetach.BringToFront();
+
+            // Z-Order düzeltmesi: Fill olan RTB paneli en arkaya atılır ki alt panellerin altında ezilmesin
+            rtbWrapper.BringToFront();
 
             port.DataReceived += (sender, e) =>
             {
@@ -2273,14 +2839,25 @@ namespace TekDosyaSeriPort
                     // FIX #2: Port durdurulduysa veri alma
                     if (_portPaused.GetValueOrDefault(portName)) return;
                     if (!sp.IsOpen) return;
-                    string data = sp.ReadExisting();
-                    if (!string.IsNullOrEmpty(data)) lock (_receiveBuffer) _receiveBuffer[portName].Append(data);
+                    string data;
+                    try { data = sp.ReadExisting(); }
+                    catch (InvalidOperationException) { return; } // Port kapanmış olabilir (race condition)
+                    catch (System.IO.IOException) { return; } // Port fiziksel olarak çıkarılmış olabilir
+                    if (!string.IsNullOrEmpty(data))
+                    {
+                        lock (_receiveBuffer)
+                        {
+                            if (_receiveBuffer.ContainsKey(portName))
+                                _receiveBuffer[portName].Append(data);
+                        }
+                    }
                 }
-                catch { }
+                catch (Exception) { /* Port erişim hatası — güvenli şekilde yoksay */ }
             };
 
             flushTmr.Tick += (s, e) =>
             {
+                if (rtbOutput.IsDisposed || groupBox.IsDisposed) return;
                 string chunk;
                 lock (_receiveBuffer)
                 {
@@ -2301,7 +2878,23 @@ namespace TekDosyaSeriPort
                         {
                             if (_portMap.TryGetValue(groupBox, out SerialPort? sp) && sp != null && sp.IsOpen)
                             {
-                                try { sp.Close(); System.Threading.Thread.Sleep(200); sp.Open(); sp.DiscardInBuffer(); sp.DiscardOutBuffer(); string errTxt = Lang.Get("\n[UYARI] Port kilitlenmesi önlendi.\n", "\n[WARN] Port freeze prevented.\n"); rtbOutput.BeginInvoke((MethodInvoker)(() => { if (!rtbOutput.IsDisposed) AppendColoredText(rtbOutput, errTxt, portName, boldFont, regularFont, tsColor); })); } catch { }
+                                // FIX: UI thread'inde Thread.Sleep kullanma — async port reset yap
+                                try {
+                                    sp.Close();
+                                    // Port reset'i timer ile geciktirilmiş yap (UI donmasını önle)
+                                    var resetTimer = new System.Windows.Forms.Timer { Interval = 200 };
+                                    resetTimer.Tick += (rs, re) => {
+                                        resetTimer.Stop(); resetTimer.Dispose();
+                                        try {
+                                            if (_portMap.ContainsKey(groupBox) && !groupBox.IsDisposed) {
+                                                sp.Open(); sp.DiscardInBuffer(); sp.DiscardOutBuffer();
+                                                string errTxt = Lang.Get("\n[UYARI] Port kilitlenmesi önlendi.\n", "\n[WARN] Port freeze prevented.\n");
+                                                if (!rtbOutput.IsDisposed) AppendColoredText(rtbOutput, errTxt, portName, boldFont, regularFont, tsColor);
+                                            }
+                                        } catch { }
+                                    };
+                                    resetTimer.Start();
+                                } catch { }
                             }
                             repeatCount = 0; lastTime = DateTime.Now;
                         }
@@ -2327,7 +2920,17 @@ namespace TekDosyaSeriPort
 
                 if (_scrollFrozen.GetValueOrDefault(portName) || _minimizedBoxes.ContainsKey(portName))
                 {
-                    if (_frozenBuffer.ContainsKey(portName)) _frozenBuffer[portName].Append(chunk);
+                    if (_frozenBuffer.ContainsKey(portName))
+                    {
+                        _frozenBuffer[portName].Append(chunk);
+                        // FIX: Frozen buffer sınırsız büyümesin — 5MB üzerinde eski veriyi kes
+                        if (_frozenBuffer[portName].Length > 5_000_000)
+                        {
+                            string buf = _frozenBuffer[portName].ToString();
+                            int cutAt = buf.IndexOf('\n', buf.Length / 5);
+                            if (cutAt > 0) _frozenBuffer[portName] = new StringBuilder(buf.Substring(cutAt + 1));
+                        }
+                    }
                 }
                 else
                 {
@@ -2337,7 +2940,14 @@ namespace TekDosyaSeriPort
                     if (hasSelection) SendMessage(rtbOutput.Handle, 0x000B, IntPtr.Zero, IntPtr.Zero);
                     AppendColoredText(rtbOutput, chunk, portName, boldFont, regularFont, tsColor);
                     if (hasSelection) { rtbOutput.SelectionStart = sStart; rtbOutput.SelectionLength = sLen; SendMessage(rtbOutput.Handle, 0x000B, new IntPtr(1), IntPtr.Zero); rtbOutput.Invalidate(); }
-                    else rtbOutput.ScrollToCaret();
+                    else
+                    {
+                        rtbOutput.ScrollToCaret();
+                        // Arayüzün yazıyı çizmesini bekle ve kesin olarak en alta it
+                        rtbOutput.BeginInvoke(new Action(() => {
+                            if (!rtbOutput.IsDisposed) rtbOutput.ScrollToAbsoluteBottom();
+                        }));
+                    }
                 }
             };
 
@@ -2402,7 +3012,7 @@ namespace TekDosyaSeriPort
             try
             {
                 rtb.SelectionStart = 0; rtb.SelectionLength = rtb.TextLength; rtb.SelectionBackColor = newBack;
-                if (_highlightRegex != null && _highlightRules.Count > 0) { var matches = _highlightRegex.Matches(rtb.Text); foreach (Match m in matches) { rtb.SelectionStart = m.Index; rtb.SelectionLength = m.Length; if (_highlightRules.TryGetValue(m.Value, out var colors)) { rtb.SelectionColor = colors.Fore; rtb.SelectionBackColor = colors.Back; rtb.SelectionFont = new Font(rtb.Font, FontStyle.Bold); } } }
+                if (_highlightRegex != null && _highlightRules.Count > 0) { using Font hlBold = new Font(rtb.Font, FontStyle.Bold); var matches = _highlightRegex.Matches(rtb.Text); foreach (Match m in matches) { rtb.SelectionStart = m.Index; rtb.SelectionLength = m.Length; if (_highlightRules.TryGetValue(m.Value, out var colors)) { rtb.SelectionColor = colors.Fore; rtb.SelectionBackColor = colors.Back; rtb.SelectionFont = hlBold; } } }
             }
             catch { }
             finally { rtb.SelectionStart = savedStart; rtb.SelectionLength = savedLen; SendMessage(rtb.Handle, 0x000B, new IntPtr(1), IntPtr.Zero); rtb.Refresh(); }
@@ -2413,10 +3023,15 @@ namespace TekDosyaSeriPort
             if (rtb == null || rtb.IsDisposed || rtb.TextLength == 0) return;
             rtb.SuspendLayout();
             int savedStart = rtb.SelectionStart, savedLength = rtb.SelectionLength;
-            string pattern = @"\[\d{2}:\d{2}:\d{2}\.\d{3}\] ";
-            var matches = Regex.Matches(rtb.Text, pattern);
-            foreach (Match m in matches) { rtb.SelectionStart = m.Index; rtb.SelectionLength = m.Length; rtb.SelectionColor = newColor; rtb.SelectionFont = new Font(rtb.Font, FontStyle.Bold); }
-            rtb.SelectionStart = savedStart; rtb.SelectionLength = savedLength; rtb.SelectionColor = rtb.ForeColor; rtb.ResumeLayout();
+            try
+            {
+                string pattern = @"\[\d{2}:\d{2}:\d{2}\.\d{3}\] ";
+                using Font tsBold = new Font(rtb.Font, FontStyle.Bold);
+                var matches = Regex.Matches(rtb.Text, pattern);
+                foreach (Match m in matches) { rtb.SelectionStart = m.Index; rtb.SelectionLength = m.Length; rtb.SelectionColor = newColor; rtb.SelectionFont = tsBold; }
+                rtb.SelectionStart = savedStart; rtb.SelectionLength = savedLength; rtb.SelectionColor = rtb.ForeColor;
+            }
+            finally { rtb.ResumeLayout(); }
         }
 
         private Dictionary<string, string> LoadProfiles()
@@ -2433,6 +3048,25 @@ namespace TekDosyaSeriPort
 
         private void SaveProfiles(Dictionary<string, string> profiles) { File.WriteAllText(_profilesPath, System.Text.Json.JsonSerializer.Serialize(profiles)); }
 
+        // === Kapatılan portları diske kaydet / diskten yükle ===
+        private HashSet<string> LoadIgnoredPorts()
+        {
+            try
+            {
+                if (!File.Exists(_ignoredPortsPath)) return new();
+                string json = File.ReadAllText(_ignoredPortsPath);
+                var list = System.Text.Json.JsonSerializer.Deserialize<List<string>>(json);
+                return list != null ? new HashSet<string>(list) : new();
+            }
+            catch { return new(); }
+        }
+
+        private void SaveIgnoredPorts()
+        {
+            try { File.WriteAllText(_ignoredPortsPath, System.Text.Json.JsonSerializer.Serialize(_ignoredPorts.ToList())); }
+            catch { }
+        }
+
         private static string SerializeProfile(RichTextBox rtb, ComboBox cboFont, ComboBox cboSize, Color tsColor)
             => $"{rtb.ForeColor.ToArgb()}|{rtb.BackColor.ToArgb()}|{tsColor.ToArgb()}|{cboFont.SelectedItem}|{cboSize.SelectedItem}";
 
@@ -2446,7 +3080,12 @@ namespace TekDosyaSeriPort
                 rtb.ForeColor = fg; btnTc.BackColor = fg; rtb.BackColor = bg; btnBg.BackColor = bg; btnTs.BackColor = ts;
                 if (cboFont.Items.Contains(fn)) cboFont.SelectedItem = fn;
                 if (cboSize.Items.Contains(fs)) cboSize.SelectedItem = fs;
+                // FIX: Eski fontları dispose et (memory leak önleme)
+                var oldRegular = regular;
+                var oldBold = bold;
                 regular = new Font(fn, fs, FontStyle.Regular); bold = new Font(fn, fs, FontStyle.Bold); rtb.Font = regular;
+                oldRegular?.Dispose();
+                oldBold?.Dispose();
                 return ts;
             }
             catch { return Color.FromArgb(0, 200, 220); }
@@ -2523,7 +3162,18 @@ namespace TekDosyaSeriPort
                 if (isLineEnd) { rtb.SelectionStart = rtb.TextLength; rtb.SelectionLength = 0; rtb.SelectionBackColor = rtb.BackColor; rtb.SelectionFont = regularFont; rtb.AppendText("\n"); _atLineStart[portName] = true; }
             }
             // Bellek taşmasını önle
-            if (rtb.Text.Length > 5_000_000) { int cutAt = rtb.Text.IndexOf('\n', rtb.TextLength / 5); if (cutAt > 0) { rtb.SelectionStart = 0; rtb.SelectionLength = cutAt + 1; rtb.SelectedText = ""; } _atLineStart[portName] = true; }
+            if (rtb.TextLength > 5_000_000)
+            {
+                int cutAt = rtb.Text.IndexOf('\n', rtb.TextLength / 5);
+                if (cutAt > 0)
+                {
+                    SendMessage(rtb.Handle, 0x000B /*WM_SETREDRAW*/, IntPtr.Zero, IntPtr.Zero);
+                    rtb.SelectionStart = 0; rtb.SelectionLength = cutAt + 1; rtb.SelectedText = "";
+                    SendMessage(rtb.Handle, 0x000B /*WM_SETREDRAW*/, new IntPtr(1), IntPtr.Zero);
+                    rtb.Invalidate();
+                }
+                _atLineStart[portName] = true;
+            }
         }
 
         // Satır bazlı tekrar bastırma: 1 sn içinde aynı satır > 5 kez gelirse ekrana yazma
@@ -2606,6 +3256,7 @@ namespace TekDosyaSeriPort
         private void ResetIgnoredPorts()
         {
             _ignoredPorts.Clear();
+            SaveIgnoredPorts();
             MessageBox.Show(Lang.Get("Gizlenen port listesi temizlendi.", "Ignored port list cleared."), Lang.Get("Bilgi", "Info"), MessageBoxButtons.OK, MessageBoxIcon.Information);
             UpdateStatusBar();
         }
@@ -2622,7 +3273,7 @@ namespace TekDosyaSeriPort
             Button btnOk = new Button { Text = Lang.Get("Aç", "Open"), Dock = DockStyle.Bottom, Height = 32, FlatStyle = FlatStyle.Flat, BackColor = Color.FromArgb(0, 122, 204), ForeColor = Color.White, Font = new Font("Segoe UI", 9f, FontStyle.Bold) };
             btnOk.FlatAppearance.BorderSize = 0; btnOk.Click += (s, e) => dlg.DialogResult = DialogResult.OK; lst.DoubleClick += (s, e) => dlg.DialogResult = DialogResult.OK;
             dlg.Controls.Add(lst); dlg.Controls.Add(lbl); dlg.Controls.Add(btnOk);
-            if (dlg.ShowDialog(this) == DialogResult.OK && lst.SelectedItem is string selected) { _ignoredPorts.Remove(selected); if (TryCreatePortWindow(selected)) _busyPorts.Remove(selected); else _busyPorts.Add(selected); RearrangeGrid(); UpdateStatusBar(); }
+            if (dlg.ShowDialog(this) == DialogResult.OK && lst.SelectedItem is string selected) { _ignoredPorts.Remove(selected); SaveIgnoredPorts(); if (TryCreatePortWindow(selected)) _busyPorts.Remove(selected); else _busyPorts.Add(selected); RearrangeGrid(); UpdateStatusBar(); }
         }
 
         private void CloseSpecificPort(GroupBox boxToRemove, bool refreshGrid, bool addToIgnoreList)
@@ -2635,9 +3286,12 @@ namespace TekDosyaSeriPort
 
             if (_portMap.ContainsKey(boxToRemove))
             {
-                SerialPort p = _portMap[boxToRemove]; string pName = p.PortName;
-                if (addToIgnoreList) _ignoredPorts.Add(pName);
-                _atLineStart.Remove(pName); _scrollFrozen.Remove(pName); _frozenBuffer.Remove(pName);
+                SerialPort p = _portMap[boxToRemove];
+                if (p == null) { _portMap.Remove(boxToRemove); return; }
+                string pName = p.PortName;
+                if (addToIgnoreList) { _ignoredPorts.Add(pName); SaveIgnoredPorts(); }
+                _atLineStart.Remove(pName); _scrollFrozen.Remove(pName);
+                if (_frozenBuffer.TryGetValue(pName, out var fb)) { fb.Clear(); _frozenBuffer.Remove(pName); }
                 _logAtLineStart.Remove(pName); _loggingEnabled.Remove(pName); _repeatCheck.Remove(pName);
                 _portPaused.Remove(pName); // FIX #2
                 _lineRepeat.Remove(pName); // FIX: LineRepeat temizliği
@@ -2679,12 +3333,22 @@ namespace TekDosyaSeriPort
         {
             if (_isArranging || _zoomedBox != null) return;
             _isArranging = true;
+            _mainLayout.SuspendLayout();
             try
             {
-                _mainLayout.SuspendLayout();
+                // UX: Welcome label göster/gizle
+                bool hasGroupBoxes = _mainLayout.Controls.Cast<Control>().Any(c => c is GroupBox);
+                if (_welcomeLabel != null && !_welcomeLabel.IsDisposed)
+                {
+                    if (hasGroupBoxes && _mainLayout.Controls.Contains(_welcomeLabel))
+                        _mainLayout.Controls.Remove(_welcomeLabel);
+                    else if (!hasGroupBoxes && !_mainLayout.Controls.Contains(_welcomeLabel))
+                        _mainLayout.Controls.Add(_welcomeLabel);
+                    _welcomeLabel.Visible = !hasGroupBoxes;
+                }
 
                 int count = _mainLayout.Controls.Count;
-                if (count == 0) { _mainLayout.ResumeLayout(); return; }
+                if (count == 0) return;
 
                 int cols = (int)Math.Ceiling(Math.Sqrt(count));
                 int rows = (int)Math.Ceiling((double)count / cols);
@@ -2714,10 +3378,12 @@ namespace TekDosyaSeriPort
                     ctrl.Dock = DockStyle.Fill;
                     ctrl.Margin = new Padding(4);
                 }
-
-                _mainLayout.ResumeLayout(true);
             }
-            finally { _isArranging = false; }
+            finally
+            {
+                _mainLayout.ResumeLayout(true);
+                _isArranging = false;
+            }
         }
 
         private void ToggleZoom(GroupBox targetBox)
@@ -2732,6 +3398,8 @@ namespace TekDosyaSeriPort
 
             Button? btnZ = targetBox.Controls.OfType<Button>().FirstOrDefault(b => b.Tag?.ToString() == "btnZoom");
             this.SuspendLayout();
+            try
+            {
             if (_zoomedBox == null)
             {
                 _zoomedBox = targetBox;
@@ -2743,7 +3411,7 @@ namespace TekDosyaSeriPort
             }
             else
             {
-                if (_zoomedBox != targetBox) { this.ResumeLayout(); return; }
+                if (_zoomedBox != targetBox) { return; }
                 this.Controls.Remove(targetBox);
                 targetBox.Dock = DockStyle.None;
                 _mainLayout.Controls.Add(targetBox);
@@ -2751,7 +3419,8 @@ namespace TekDosyaSeriPort
                 if (btnZ != null) btnZ.Text = "◻";
                 RearrangeGrid();
             }
-            this.ResumeLayout();
+            }
+            finally { this.ResumeLayout(); }
         }
 
         protected override void OnFormClosing(FormClosingEventArgs e)
@@ -2763,10 +3432,18 @@ namespace TekDosyaSeriPort
                 _activeLoads.Clear();
             }
             _portScanner?.Stop();
+            _portScanner?.Dispose();
+            _processMonitor?.Stop();
+            _processMonitor?.Dispose();
             foreach (var tmr in _flushTimer.Values) { try { tmr.Stop(); tmr.Dispose(); } catch { } }
-            foreach (var p in _portMap.Values) if (p.IsOpen) try { p.Close(); } catch { }
+            _flushTimer.Clear();
+            foreach (var p in _portMap.Values) { try { if (p.IsOpen) p.Close(); p.Dispose(); } catch { } }
+            _portMap.Clear();
             foreach (var gb in _minimizedBoxes.Values) if (gb != null && !gb.IsDisposed) gb.Dispose();
+            _minimizedBoxes.Clear();
             foreach (var df in _detachedForms.ToList()) try { df.Close(); } catch { }
+            _detachedForms.Clear();
+            _toolTip?.Dispose();
             base.OnFormClosing(e);
         }
     }
